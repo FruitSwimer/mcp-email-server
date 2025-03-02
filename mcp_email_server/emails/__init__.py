@@ -1,9 +1,9 @@
 import abc
 from datetime import datetime
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Dict, Any, Tuple
 
 if TYPE_CHECKING:
-    from mcp_email_server.emails.models import EmailPageResponse
+    from mcp_email_server.emails.models import EmailPageResponse, AttachmentData
 
 
 class EmailHandler(abc.ABC):
@@ -52,4 +52,34 @@ class EmailHandler(abc.ABC):
     async def get_folders(self) -> List[str]:
         """
         Get list of available folders/mailboxes
+        """
+        
+    @abc.abstractmethod
+    async def get_attachments(self, message_id: str) -> List["AttachmentData"]:
+        """
+        Get list of attachments for an email
+        """
+        
+    @abc.abstractmethod
+    async def download_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        """
+        Download a specific attachment from an email
+        """
+        
+    @abc.abstractmethod
+    async def send_email_with_attachments(
+        self, 
+        recipient: str, 
+        subject: str, 
+        body: str, 
+        attachments: List[Tuple[str, bytes]]
+    ) -> None:
+        """
+        Send email with attachments
+        
+        Args:
+            recipient: Email recipient
+            subject: Email subject
+            body: Email body
+            attachments: List of tuples containing (filename, file_content)
         """

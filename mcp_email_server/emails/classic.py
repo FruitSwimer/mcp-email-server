@@ -24,6 +24,9 @@ class EmailClient:
 
         self.smtp_use_tls = self.email_server.use_ssl
         self.smtp_start_tls = self.email_server.start_ssl
+        
+        # Default trash folder names across various email providers
+        self.trash_folders = ["Trash", "INBOX.Trash", "Deleted Items", "Deleted Messages", "Bin"]
 
     def _parse_email_data(self, raw_email: bytes) -> dict[str, Any]:  # noqa: C901
         """Parse raw email data into a structured dictionary."""
@@ -236,6 +239,124 @@ class EmailClient:
         ) as smtp:
             await smtp.login(self.email_server.user_name, self.email_server.password)
             await smtp.send_message(msg)
+            
+    async def store_flags(self, message_ids: list[str], flag_action: str, flag: str) -> None:
+        """Set or unset flags for messages.
+        
+        Args:
+            message_ids: List of message IDs to modify
+            flag_action: '+FLAGS' to add flags, '-FLAGS' to remove flags
+            flag: The flag to set or unset (e.g., '\\Seen', '\\Deleted')
+        """
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+        try:
+            # Establish connection and login
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            await imap.select("INBOX")
+            
+            # Process message_ids as a comma-separated string
+            message_set = ",".join(message_ids)
+            
+            # Store the flag
+            response = await imap.store(message_set, flag_action, flag)
+            if response.result != "OK":
+                logger.error(f"Failed to set flags: {response}")
+                
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+                
+    async def move_messages(self, message_ids: list[str], destination_folder: str) -> None:
+        """Move messages to another folder.
+        
+        Args:
+            message_ids: List of message IDs to move
+            destination_folder: Destination folder name
+        """
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+        try:
+            # Establish connection and login
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            await imap.select("INBOX")
+            
+            # First, copy the messages to the destination folder
+            message_set = ",".join(message_ids)
+            response = await imap.copy(message_set, destination_folder)
+            
+            if response.result != "OK":
+                logger.error(f"Failed to copy messages to {destination_folder}: {response}")
+                return
+                
+            # Then mark the original messages as deleted
+            await imap.store(message_set, "+FLAGS", "\\Deleted")
+            
+            # Expunge to remove the deleted messages
+            await imap.expunge()
+            
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+                
+    async def get_all_folders(self) -> list[str]:
+        """Get a list of all available mailbox folders."""
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+        try:
+            # Establish connection and login
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            
+            # List all folders
+            response = await imap.list()
+            if response.result != "OK":
+                logger.error(f"Failed to list folders: {response}")
+                return []
+                
+            # Parse the folder list from the response
+            folders = []
+            for line in response.lines:
+                if line:
+                    try:
+                        # Folder names are typically in the format: (flags) "separator" "name"
+                        parts = line.split(b'"')
+                        if len(parts) >= 3:  # We need at least 3 parts to extract the folder name
+                            folder_name = parts[-2].decode('utf-8')
+                            folders.append(folder_name)
+                    except Exception as e:
+                        logger.error(f"Error parsing folder name: {e}")
+            
+            return folders
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+                
+    async def find_trash_folder(self) -> str:
+        """Find the appropriate trash folder for this mail server."""
+        folders = await self.get_all_folders()
+        
+        # Try to find a matching trash folder
+        for trash_name in self.trash_folders:
+            if trash_name in folders:
+                return trash_name
+        
+        # If no standard trash folder is found, return the first one that contains 'trash' or 'deleted' (case insensitive)
+        for folder in folders:
+            folder_lower = folder.lower()
+            if 'trash' in folder_lower or 'deleted' in folder_lower or 'bin' in folder_lower:
+                return folder
+        
+        # If still no match, default to 'Trash' (which may not exist, but we'll handle that error when trying to move)
+        return "Trash"
 
 
 class ClassicEmailHandler(EmailHandler):
@@ -279,3 +400,54 @@ class ClassicEmailHandler(EmailHandler):
 
     async def send_email(self, recipient: str, subject: str, body: str) -> None:
         await self.outgoing_client.send_email(recipient, subject, body)
+        
+    async def mark_as_read(self, message_ids: list[str], read: bool = True) -> None:
+        """Mark emails as read or unread.
+        
+        Args:
+            message_ids: List of message IDs to modify
+            read: True to mark as read, False to mark as unread
+        """
+        flag_action = "+FLAGS" if read else "-FLAGS"
+        await self.incoming_client.store_flags(message_ids, flag_action, "\\Seen")
+        
+    async def move_email(self, message_ids: list[str], destination_folder: str) -> None:
+        """Move emails to another folder.
+        
+        Args:
+            message_ids: List of message IDs to move
+            destination_folder: Destination folder name
+        """
+        await self.incoming_client.move_messages(message_ids, destination_folder)
+        
+    async def delete_email(self, message_ids: list[str], permanent: bool = False) -> None:
+        """Delete emails (move to trash or permanently delete).
+        
+        Args:
+            message_ids: List of message IDs to delete
+            permanent: If True, permanently delete; if False, move to trash
+        """
+        if permanent:
+            # Mark messages as deleted and expunge
+            await self.incoming_client.store_flags(message_ids, "+FLAGS", "\\Deleted")
+            # We need to reconnect to expunge
+            imap = self.incoming_client.imap_class(self.incoming_client.email_server.host, self.incoming_client.email_server.port)
+            try:
+                await imap._client_task
+                await imap.wait_hello_from_server()
+                await imap.login(self.incoming_client.email_server.user_name, self.incoming_client.email_server.password)
+                await imap.select("INBOX")
+                await imap.expunge()
+            finally:
+                try:
+                    await imap.logout()
+                except Exception as e:
+                    logger.info(f"Error during logout: {e}")
+        else:
+            # Move to trash folder
+            trash_folder = await self.incoming_client.find_trash_folder()
+            await self.move_email(message_ids, trash_folder)
+            
+    async def get_folders(self) -> list[str]:
+        """Get list of available folders/mailboxes."""
+        return await self.incoming_client.get_all_folders()

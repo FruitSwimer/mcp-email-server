@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import List, Tuple
 
 from mcp.server.fastmcp import FastMCP
 
@@ -9,7 +10,7 @@ from mcp_email_server.config import (
     get_settings,
 )
 from mcp_email_server.emails.dispatcher import dispatch_handler
-from mcp_email_server.emails.models import EmailPageResponse
+from mcp_email_server.emails.models import AttachmentData, EmailPageResponse
 
 mcp = FastMCP("email")
 
@@ -122,3 +123,56 @@ async def list_folders(account_name: str) -> list[str]:
     """
     handler = dispatch_handler(account_name)
     return await handler.get_folders()
+
+
+@mcp.tool(description="Get list of attachments for an email.")
+async def get_attachments(account_name: str, message_id: str) -> List[AttachmentData]:
+    """Get list of attachments for an email.
+    
+    Args:
+        account_name: Name of the email account
+        message_id: ID of the email message
+        
+    Returns:
+        List of attachment metadata
+    """
+    handler = dispatch_handler(account_name)
+    return await handler.get_attachments(message_id)
+
+
+@mcp.tool(description="Download a specific attachment from an email.")
+async def download_attachment(account_name: str, message_id: str, attachment_id: str) -> bytes:
+    """Download a specific attachment from an email.
+    
+    Args:
+        account_name: Name of the email account
+        message_id: ID of the email message
+        attachment_id: ID of the attachment to download
+        
+    Returns:
+        The attachment content as bytes
+    """
+    handler = dispatch_handler(account_name)
+    return await handler.download_attachment(message_id, attachment_id)
+
+
+@mcp.tool(description="Send email with attachments.")
+async def send_email_with_attachments(
+    account_name: str, 
+    recipient: str, 
+    subject: str, 
+    body: str, 
+    attachments: List[Tuple[str, bytes]]
+) -> None:
+    """Send email with attachments.
+    
+    Args:
+        account_name: Name of the email account
+        recipient: Email recipient
+        subject: Email subject
+        body: Email body
+        attachments: List of tuples containing (filename, file_content)
+    """
+    handler = dispatch_handler(account_name)
+    await handler.send_email_with_attachments(recipient, subject, body, attachments)
+    return

@@ -1,7 +1,15 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, List, Dict, Optional
 
 from pydantic import BaseModel
+
+
+class AttachmentData(BaseModel):
+    attachment_id: str
+    filename: str
+    size: int
+    content_type: str
+    message_id: str
 
 
 class EmailData(BaseModel):
@@ -9,16 +17,18 @@ class EmailData(BaseModel):
     sender: str
     body: str
     date: datetime
-    attachments: list[str]
+    attachments: List[str]  # List of attachment filenames
+    message_id: Optional[str] = None  # IMAP message ID
 
     @classmethod
-    def from_email(cls, email: dict[str, Any]):
+    def from_email(cls, email: Dict[str, Any]):
         return cls(
             subject=email["subject"],
             sender=email["from"],
             body=email["body"],
             date=email["date"],
             attachments=email["attachments"],
+            message_id=email.get("message_id"),
         )
 
 
@@ -30,5 +40,5 @@ class EmailPageResponse(BaseModel):
     subject: str | None
     body: str | None
     text: str | None
-    emails: list[EmailData]
+    emails: List[EmailData]
     total: int

@@ -1,17 +1,21 @@
 import email.utils
+import hashlib
+import os
 from collections.abc import AsyncGenerator
 from datetime import datetime
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
 from email.policy import default
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import aioimaplib
 import aiosmtplib
 
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
-from mcp_email_server.emails.models import EmailData, EmailPageResponse
+from mcp_email_server.emails.models import AttachmentData, EmailData, EmailPageResponse
 from mcp_email_server.log import logger
 
 
@@ -28,7 +32,14 @@ class EmailClient:
         # Default trash folder names across various email providers
         self.trash_folders = ["Trash", "INBOX.Trash", "Deleted Items", "Deleted Messages", "Bin"]
 
-    def _parse_email_data(self, raw_email: bytes) -> dict[str, Any]:  # noqa: C901
+    def _generate_attachment_id(self, message_id: str, filename: str) -> str:
+        """Generate a unique ID for an attachment."""
+        # Combine message ID and filename to create a unique identifier
+        combined = f"{message_id}:{filename}"
+        # Create a hash to use as the attachment ID
+        return hashlib.md5(combined.encode('utf-8')).hexdigest()
+        
+    def _parse_email_data(self, raw_email: bytes, message_id: str = None) -> Dict[str, Any]:  # noqa: C901
         """Parse raw email data into a structured dictionary."""
         parser = BytesParser(policy=default)
         email_message = parser.parsebytes(raw_email)
@@ -48,6 +59,7 @@ class EmailClient:
         # Get body content
         body = ""
         attachments = []
+        attachment_details = []
 
         if email_message.is_multipart():
             for part in email_message.walk():
@@ -58,7 +70,23 @@ class EmailClient:
                 if "attachment" in content_disposition:
                     filename = part.get_filename()
                     if filename:
+                        # Generate a unique attachment ID using the message ID and filename
+                        attachment_id = self._generate_attachment_id(message_id, filename) if message_id else None
+                        
+                        # Add filename to simple list for backwards compatibility
                         attachments.append(filename)
+                        
+                        # Add detailed attachment info
+                        if attachment_id:
+                            content_bytes = part.get_payload(decode=True)
+                            size = len(content_bytes) if content_bytes else 0
+                            attachment_details.append({
+                                "attachment_id": attachment_id,
+                                "filename": filename,
+                                "size": size,
+                                "content_type": content_type,
+                                "message_id": message_id,
+                            })
                 # Handle text parts
                 elif content_type == "text/plain":
                     body_part = part.get_payload(decode=True)
@@ -84,6 +112,8 @@ class EmailClient:
             "body": body,
             "date": date,
             "attachments": attachments,
+            "attachment_details": attachment_details,
+            "message_id": message_id,
         }
 
     async def get_emails_stream(
@@ -146,7 +176,7 @@ class EmailClient:
 
                     if raw_email:
                         try:
-                            parsed_email = self._parse_email_data(raw_email)
+                            parsed_email = self._parse_email_data(raw_email, message_id_str)
                             yield parsed_email
                         except Exception as e:
                             # Log error but continue with other emails
@@ -357,6 +387,166 @@ class EmailClient:
         
         # If still no match, default to 'Trash' (which may not exist, but we'll handle that error when trying to move)
         return "Trash"
+        
+    async def get_attachment(self, message_id: str, attachment_id: str) -> Tuple[bytes, str, str]:
+        """Get attachment content by message ID and attachment ID.
+        
+        Returns:
+            Tuple containing (attachment_content, filename, content_type)
+        """
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+        try:
+            # Establish connection and login
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            await imap.select("INBOX")
+            
+            # Fetch the email containing the attachment
+            _, data = await imap.fetch(message_id, "RFC822")
+            
+            # Extract the email data
+            raw_email = None
+            if len(data) > 1 and isinstance(data[1], bytearray) and len(data[1]) > 0:
+                raw_email = bytes(data[1])
+            else:
+                # Fallback to searching through all items
+                for _, item in enumerate(data):
+                    if isinstance(item, (bytes, bytearray)) and len(item) > 100:
+                        if isinstance(item, bytes) and b"FETCH" in item:
+                            continue
+                        raw_email = bytes(item) if isinstance(item, bytearray) else item
+                        break
+            
+            if not raw_email:
+                logger.error(f"Could not find email data for message ID: {message_id}")
+                return b"", "", ""
+            
+            # Parse the email
+            parser = BytesParser(policy=default)
+            email_message = parser.parsebytes(raw_email)
+            
+            # Find the attachment
+            for part in email_message.walk():
+                content_disposition = str(part.get("Content-Disposition", ""))
+                if "attachment" in content_disposition:
+                    filename = part.get_filename()
+                    if not filename:
+                        continue
+                        
+                    # Check if this is the requested attachment
+                    generated_id = self._generate_attachment_id(message_id, filename)
+                    if generated_id == attachment_id:
+                        content_type = part.get_content_type()
+                        content = part.get_payload(decode=True)
+                        if content is None:
+                            content = b""
+                        return content, filename, content_type
+            
+            logger.error(f"Attachment with ID {attachment_id} not found in message {message_id}")
+            return b"", "", ""
+            
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+                
+    async def get_all_attachments(self, message_id: str) -> List[AttachmentData]:
+        """Get all attachments for a specific message."""
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+        try:
+            # Establish connection and login
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            await imap.select("INBOX")
+            
+            # Fetch the email containing the attachments
+            _, data = await imap.fetch(message_id, "RFC822")
+            
+            # Extract the email data
+            raw_email = None
+            if len(data) > 1 and isinstance(data[1], bytearray) and len(data[1]) > 0:
+                raw_email = bytes(data[1])
+            else:
+                # Fallback to searching through all items
+                for _, item in enumerate(data):
+                    if isinstance(item, (bytes, bytearray)) and len(item) > 100:
+                        if isinstance(item, bytes) and b"FETCH" in item:
+                            continue
+                        raw_email = bytes(item) if isinstance(item, bytearray) else item
+                        break
+            
+            if not raw_email:
+                logger.error(f"Could not find email data for message ID: {message_id}")
+                return []
+            
+            # Parse the email
+            email_data = self._parse_email_data(raw_email, message_id)
+            attachment_details = email_data.get("attachment_details", [])
+            
+            return [AttachmentData(**detail) for detail in attachment_details]
+            
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+                
+    async def send_email_with_attachments(self, recipient: str, subject: str, body: str, attachments: List[Tuple[str, bytes]]):
+        """Send email with attachments.
+        
+        Args:
+            recipient: Email recipient
+            subject: Email subject
+            body: Email body
+            attachments: List of tuples containing (filename, file_content)
+        """
+        # Create a multipart message
+        msg = MIMEMultipart()
+        msg["Subject"] = subject
+        msg["From"] = self.sender
+        msg["To"] = recipient
+        
+        # Attach the body as text
+        msg.attach(MIMEText(body))
+        
+        # Attach each file
+        for filename, file_content in attachments:
+            attachment = MIMEApplication(file_content)
+            # Add header with filename
+            attachment.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=os.path.basename(filename)
+            )
+            # Determine content type (simplified approach)
+            extension = os.path.splitext(filename)[1].lower()
+            if extension in [".jpg", ".jpeg"]:
+                attachment.add_header("Content-Type", "image/jpeg")
+            elif extension == ".png":
+                attachment.add_header("Content-Type", "image/png")
+            elif extension == ".pdf":
+                attachment.add_header("Content-Type", "application/pdf")
+            elif extension in [".doc", ".docx"]:
+                attachment.add_header("Content-Type", "application/msword")
+            elif extension in [".xls", ".xlsx"]:
+                attachment.add_header("Content-Type", "application/vnd.ms-excel")
+            elif extension == ".txt":
+                attachment.add_header("Content-Type", "text/plain")
+            # Add attachment to message
+            msg.attach(attachment)
+        
+        # Send the email
+        async with aiosmtplib.SMTP(
+            hostname=self.email_server.host,
+            port=self.email_server.port,
+            start_tls=self.smtp_start_tls,
+            use_tls=self.smtp_use_tls,
+        ) as smtp:
+            await smtp.login(self.email_server.user_name, self.email_server.password)
+            await smtp.send_message(msg)
 
 
 class ClassicEmailHandler(EmailHandler):
@@ -451,3 +641,22 @@ class ClassicEmailHandler(EmailHandler):
     async def get_folders(self) -> list[str]:
         """Get list of available folders/mailboxes."""
         return await self.incoming_client.get_all_folders()
+        
+    async def get_attachments(self, message_id: str) -> List[AttachmentData]:
+        """Get list of attachments for an email."""
+        return await self.incoming_client.get_all_attachments(message_id)
+        
+    async def download_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        """Download a specific attachment from an email."""
+        content, _, _ = await self.incoming_client.get_attachment(message_id, attachment_id)
+        return content
+        
+    async def send_email_with_attachments(
+        self, 
+        recipient: str, 
+        subject: str, 
+        body: str, 
+        attachments: List[Tuple[str, bytes]]
+    ) -> None:
+        """Send email with attachments."""
+        await self.outgoing_client.send_email_with_attachments(recipient, subject, body, attachments)
